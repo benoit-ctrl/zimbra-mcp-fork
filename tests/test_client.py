@@ -266,6 +266,50 @@ class TestCreateDraft:
         params = _get_request_params(connected_client)
         assert params["m"]["attach"]["m"]["id"] == "20"
 
+    def test_draft_plain_text_is_default(self, connected_client):
+        resp = _make_ok_response("SaveDraftResponse", {"m": {"id": "54"}})
+        _setup_response(connected_client, resp)
+
+        connected_client.create_draft(
+            to=["bob@test.com"], subject="Hi", body="Plain body",
+        )
+        params = _get_request_params(connected_client)
+        assert params["m"]["mp"]["ct"] == "text/plain"
+        assert params["m"]["mp"]["content"] == "Plain body"
+
+    def test_draft_html(self, connected_client):
+        resp = _make_ok_response("SaveDraftResponse", {"m": {"id": "55"}})
+        _setup_response(connected_client, resp)
+
+        connected_client.create_draft(
+            to=["bob@test.com"], subject="Hi",
+            body="<p>Hello <b>Bob</b></p>", html=True,
+        )
+        params = _get_request_params(connected_client)
+        mp = params["m"]["mp"]
+        assert mp["ct"] == "multipart/alternative"
+        subparts = mp["mp"]
+        assert len(subparts) == 2
+        plain, html = subparts
+        assert plain["ct"] == "text/plain"
+        assert html["ct"] == "text/html"
+        assert html["content"] == "<p>Hello <b>Bob</b></p>"
+        # auto-generated fallback strips the tags
+        assert "Hello" in plain["content"]
+        assert "<" not in plain["content"]
+
+    def test_draft_html_custom_text_alt(self, connected_client):
+        resp = _make_ok_response("SaveDraftResponse", {"m": {"id": "56"}})
+        _setup_response(connected_client, resp)
+
+        connected_client.create_draft(
+            to=["bob@test.com"], subject="Hi",
+            body="<p>Hello</p>", html=True, text_alt="Custom fallback",
+        )
+        params = _get_request_params(connected_client)
+        plain = params["m"]["mp"]["mp"][0]
+        assert plain["content"] == "Custom fallback"
+
 
 class TestSendMessage:
     def test_send_basic(self, connected_client):
@@ -301,6 +345,62 @@ class TestSendMessage:
         params = _get_request_params(connected_client)
         assert params["m"]["origid"] == "10"
         assert params["m"]["rt"] == "r"
+
+    def test_send_plain_text_is_default(self, connected_client):
+        resp = _make_ok_response("SendMsgResponse", {"m": {"id": "103"}})
+        _setup_response(connected_client, resp)
+
+        connected_client.send_message(
+            to=["bob@test.com"], subject="Hi", body="Hello",
+        )
+        params = _get_request_params(connected_client)
+        assert params["m"]["mp"]["ct"] == "text/plain"
+        assert params["m"]["mp"]["content"] == "Hello"
+
+    def test_send_html(self, connected_client):
+        resp = _make_ok_response("SendMsgResponse", {"m": {"id": "104"}})
+        _setup_response(connected_client, resp)
+
+        connected_client.send_message(
+            to=["bob@test.com"], subject="Hi",
+            body="<p>Hello <b>Bob</b></p>", html=True,
+        )
+        params = _get_request_params(connected_client)
+        mp = params["m"]["mp"]
+        assert mp["ct"] == "multipart/alternative"
+        plain, html = mp["mp"]
+        assert plain["ct"] == "text/plain"
+        assert html["ct"] == "text/html"
+        assert html["content"] == "<p>Hello <b>Bob</b></p>"
+        assert "Hello" in plain["content"]
+        assert "<" not in plain["content"]
+
+
+class TestBuildMimePart:
+    def test_plain_default(self):
+        from zimbra_mcp.client import _build_mime_part
+
+        part = _build_mime_part("hello")
+        assert part == {"ct": "text/plain", "content": "hello"}
+
+    def test_html_generates_fallback(self):
+        from zimbra_mcp.client import _build_mime_part
+
+        part = _build_mime_part("<p>Hi <b>there</b></p>", html=True)
+        assert part["ct"] == "multipart/alternative"
+        plain, html = part["mp"]
+        assert plain["ct"] == "text/plain"
+        assert "Hi" in plain["content"]
+        assert "there" in plain["content"]
+        assert "<" not in plain["content"]
+        assert html["ct"] == "text/html"
+        assert html["content"] == "<p>Hi <b>there</b></p>"
+
+    def test_html_with_explicit_text_alt(self):
+        from zimbra_mcp.client import _build_mime_part
+
+        part = _build_mime_part("<p>Hi</p>", html=True, text_alt="plain")
+        assert part["mp"][0]["content"] == "plain"
 
 
 # --- Tag methods ---

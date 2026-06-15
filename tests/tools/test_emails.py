@@ -368,3 +368,43 @@ class TestSendEmailToolRegistration:
         connected_client.send_message.assert_called_once()
         assert result["success"] is True
         assert result["message_id"] == "200"
+
+    def test_send_email_defaults_to_plain(self, connected_client):
+        cfg = ZimbraConfig(url="https://z.test", user="u", password="p", enable_send=True)
+        tools = capture_tools(register_email_tools, connected_client, cfg)
+        connected_client.send_message = MagicMock(return_value={"m": {"id": "201"}})
+
+        tools["send_email"](to=["bob@test.com"], subject="T", body="Hi")
+
+        assert connected_client.send_message.call_args.kwargs["html"] is False
+
+    def test_send_email_passes_html(self, connected_client):
+        cfg = ZimbraConfig(url="https://z.test", user="u", password="p", enable_send=True)
+        tools = capture_tools(register_email_tools, connected_client, cfg)
+        connected_client.send_message = MagicMock(return_value={"m": {"id": "202"}})
+
+        tools["send_email"](
+            to=["bob@test.com"], subject="T", body="<p>Hi</p>", html=True,
+        )
+
+        assert connected_client.send_message.call_args.kwargs["html"] is True
+
+
+class TestCreateDraftTool:
+    def test_create_draft_defaults_to_plain(self, email_tools):
+        tools, client = email_tools
+        client.create_draft = MagicMock(return_value={"m": {"id": "60"}})
+
+        tools["create_draft"](to=["bob@test.com"], subject="T", body="Hi")
+
+        assert client.create_draft.call_args.kwargs["html"] is False
+
+    def test_create_draft_passes_html(self, email_tools):
+        tools, client = email_tools
+        client.create_draft = MagicMock(return_value={"m": {"id": "61"}})
+
+        tools["create_draft"](
+            to=["bob@test.com"], subject="T", body="<p>Hi</p>", html=True,
+        )
+
+        assert client.create_draft.call_args.kwargs["html"] is True

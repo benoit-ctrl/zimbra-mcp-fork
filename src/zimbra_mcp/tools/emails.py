@@ -388,6 +388,7 @@ def register_email_tools(mcp: FastMCP, client: ZimbraClient, config: ZimbraConfi
         orig_msg_id: str | None = None,
         reply_type: str | None = None,
         include_original: str | None = None,
+        html: bool = False,
     ) -> dict[str, Any]:
         """Create an email draft (without sending it).
 
@@ -399,15 +400,23 @@ def register_email_tools(mcp: FastMCP, client: ZimbraClient, config: ZimbraConfi
         the original message in the body). Use "attachment" to attach it as .eml
         instead, or "none" to explicitly exclude it.
 
+        Set html=True to send a styled HTML email. The body must be valid HTML
+        (use inline CSS for styling, as email clients ignore <style> blocks and
+        external stylesheets). A plain-text fallback is generated automatically
+        from the HTML. html=True is intended for NEW emails only, not for
+        replies/forwards: the quoted original is built as "> " plain text and
+        would render poorly inside HTML.
+
         Args:
             to: List of primary recipients
             subject: Email subject
-            body: Message body (plain text)
+            body: Message body. Plain text by default, valid HTML when html=True
             cc: List of CC recipients (optional)
             bcc: List of BCC recipients (optional)
             orig_msg_id: ID of the original message when replying or forwarding (optional)
             reply_type: "r" for reply, "w" for forward. Required when orig_msg_id is set (optional)
             include_original: How to include the original message: "inline" (default when replying/forwarding), "attachment", or "none" (optional)
+            html: If True, send body as HTML with an auto-generated plain-text fallback. For new emails only (default: False)
 
         Returns:
             Information about the created draft
@@ -426,7 +435,7 @@ def register_email_tools(mcp: FastMCP, client: ZimbraClient, config: ZimbraConfi
         result = client.create_draft(
             to, subject, full_body, cc=cc, bcc=bcc,
             orig_msg_id=orig_msg_id, reply_type=reply_type,
-            attach_msg_id=attach_msg_id,
+            attach_msg_id=attach_msg_id, html=html,
         )
 
         msg = result.get("m", {})
@@ -514,6 +523,7 @@ def register_email_tools(mcp: FastMCP, client: ZimbraClient, config: ZimbraConfi
             reply_type: str | None = None,
             include_original: str | None = None,
             draft_id: str | None = None,
+            html: bool = False,
         ) -> dict[str, Any]:
             """Send an email directly. WARNING: sends immediately, cannot be undone.
 
@@ -523,16 +533,24 @@ def register_email_tools(mcp: FastMCP, client: ZimbraClient, config: ZimbraConfi
             Use "attachment" to attach it as .eml instead, or "none" to
             explicitly exclude it.
 
+            Set html=True to send a styled HTML email. The body must be valid
+            HTML (use inline CSS for styling, as email clients ignore <style>
+            blocks and external stylesheets). A plain-text fallback is generated
+            automatically from the HTML. html=True is intended for NEW emails
+            only, not for replies/forwards: the quoted original is built as
+            "> " plain text and would render poorly inside HTML.
+
             Args:
                 to: List of primary recipients
                 subject: Email subject
-                body: Message body (plain text)
+                body: Message body. Plain text by default, valid HTML when html=True
                 cc: List of CC recipients (optional)
                 bcc: List of BCC recipients (optional)
                 orig_msg_id: ID of the original message when replying or forwarding (optional)
                 reply_type: "r" for reply, "w" for forward. Required when orig_msg_id is set (optional)
                 include_original: How to include the original message: "inline" (default when replying/forwarding), "attachment", or "none" (optional)
                 draft_id: ID of an existing draft to send (optional)
+                html: If True, send body as HTML with an auto-generated plain-text fallback. For new emails only (default: False)
 
             Returns:
                 Information about the sent email
@@ -551,7 +569,7 @@ def register_email_tools(mcp: FastMCP, client: ZimbraClient, config: ZimbraConfi
             result = client.send_message(
                 to, subject, full_body, cc=cc, bcc=bcc,
                 orig_msg_id=orig_msg_id, reply_type=reply_type,
-                attach_msg_id=attach_msg_id, draft_id=draft_id,
+                attach_msg_id=attach_msg_id, draft_id=draft_id, html=html,
             )
 
             msg = result.get("m", {})
