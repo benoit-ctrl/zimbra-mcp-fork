@@ -403,6 +403,110 @@ class TestBuildMimePart:
         assert part["mp"][0]["content"] == "plain"
 
 
+class TestGetSignatures:
+    def test_call(self, connected_client):
+        resp = _make_ok_response("GetSignaturesResponse", {"signature": []})
+        _setup_response(connected_client, resp)
+
+        connected_client.get_signatures()
+        call_args = connected_client._comm.gen_request.return_value.add_request.call_args
+        assert call_args[0][0] == "GetSignaturesRequest"
+        assert call_args[0][2] == "urn:zimbraAccount"
+
+    def test_result_is_cached(self, connected_client):
+        resp = _make_ok_response("GetSignaturesResponse", {"signature": []})
+        _setup_response(connected_client, resp)
+
+        connected_client.get_signatures()
+        connected_client.get_signatures()
+
+        # Second call served from cache: only one SOAP round-trip.
+        assert connected_client._comm.send_request.call_count == 1
+
+    def test_force_refresh_bypasses_cache(self, connected_client):
+        resp = _make_ok_response("GetSignaturesResponse", {"signature": []})
+        _setup_response(connected_client, resp)
+
+        connected_client.get_signatures()
+        connected_client.get_signatures(force_refresh=True)
+
+        assert connected_client._comm.send_request.call_count == 2
+
+    def test_cache_expires_after_ttl(self, connected_client):
+        from zimbra_mcp import client as client_mod
+
+        resp = _make_ok_response("GetSignaturesResponse", {"signature": []})
+        _setup_response(connected_client, resp)
+
+        with patch.object(client_mod.time, "time") as mock_time:
+            mock_time.return_value = 1000.0
+            connected_client.get_signatures()
+            # Within TTL: cached.
+            mock_time.return_value = 1000.0 + client_mod.SIGNATURES_CACHE_TTL - 1
+            connected_client.get_signatures()
+            assert connected_client._comm.send_request.call_count == 1
+            # Past TTL: re-fetch.
+            mock_time.return_value = 1000.0 + client_mod.SIGNATURES_CACHE_TTL + 1
+            connected_client.get_signatures()
+            assert connected_client._comm.send_request.call_count == 2
+
+
+class TestExtractFirstSignature:
+    def test_none_when_empty(self):
+        from zimbra_mcp.client import _extract_first_signature
+
+        assert _extract_first_signature({}) is None
+        assert _extract_first_signature({"signature": []}) is None
+        assert _extract_first_signature(None) is None
+
+    def test_list_of_parts(self):
+        from zimbra_mcp.client import _extract_first_signature
+
+        sig = _extract_first_signature({
+            "signature": [
+                {"name": "n", "id": "1", "content": [
+                    {"type": "text/html", "_content": "<p>hi</p>"},
+                ]},
+            ]
+        })
+        assert sig == {"content": "<p>hi</p>", "type": "text/html"}
+
+    def test_single_dict_signature(self):
+        from zimbra_mcp.client import _extract_first_signature
+
+        sig = _extract_first_signature({
+            "signature": {"name": "n", "id": "1", "content": "plain sig"},
+        })
+        assert sig == {"content": "plain sig", "type": "text/plain"}
+
+    def test_content_as_dict(self):
+        from zimbra_mcp.client import _extract_first_signature
+
+        sig = _extract_first_signature({
+            "signature": [
+                {"content": {"type": "text/plain", "_content": "bye"}},
+            ]
+        })
+        assert sig == {"content": "bye", "type": "text/plain"}
+
+    def test_unknown_type_falls_back_to_plain(self):
+        from zimbra_mcp.client import _extract_first_signature
+
+        sig = _extract_first_signature({
+            "signature": [
+                {"content": [{"type": "application/x-weird", "_content": "x"}]},
+            ]
+        })
+        assert sig == {"content": "x", "type": "text/plain"}
+
+    def test_returns_none_on_unexpected_structure(self):
+        from zimbra_mcp.client import _extract_first_signature
+
+        assert _extract_first_signature({"signature": ["not-a-dict"]}) is None
+        assert _extract_first_signature({"signature": [{"content": 42}]}) is None
+        assert _extract_first_signature({"signature": [{"content": []}]}) is None
+
+
 # --- Tag methods ---
 
 

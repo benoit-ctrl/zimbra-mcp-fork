@@ -147,6 +147,9 @@ class TestGuessExtension:
 
 @pytest.fixture
 def email_tools(connected_client):
+    # append_signature defaults to True, so stub get_signatures to "no
+    # signature" by default; signature-specific tests override this.
+    connected_client.get_signatures = MagicMock(return_value={})
     tools = capture_tools(register_email_tools, connected_client)
     return tools, connected_client
 
@@ -340,6 +343,51 @@ class TestPrepareBodyWithOriginal:
         assert "Original text" in body
         assert attach is None
 
+    def test_inline_reply_html(self, connected_client):
+        connected_client.get_message = MagicMock(return_value={
+            "m": {
+                "e": [{"t": "f", "a": "sender@test.com"}],
+                "d": "1700000000000",
+                "mp": [{"ct": "text/plain", "content": "Line 1\nLine 2 <b>"}],
+            }
+        })
+
+        body, attach = _prepare_body_with_original(
+            connected_client, "<p>My reply</p>", "123", "r", "inline",
+            html=True,
+        )
+        assert "<p>My reply</p>" in body
+        assert "<blockquote" in body
+        # No plain-text "> " quoting in HTML mode.
+        assert "> Line 1" not in body
+        # Original is escaped and line breaks become <br>.
+        assert "&lt;b&gt;" in body
+        assert "Line 1<br>" in body
+        assert attach is None
+
+    def test_inline_forward_html(self, connected_client):
+        connected_client.get_message = MagicMock(return_value={
+            "m": {
+                "e": [
+                    {"t": "f", "a": "sender@test.com"},
+                    {"t": "t", "a": "recipient@test.com"},
+                ],
+                "d": "1700000000000",
+                "su": "Original Subject",
+                "mp": [{"ct": "text/plain", "content": "Original text"}],
+            }
+        })
+
+        body, attach = _prepare_body_with_original(
+            connected_client, "<p>FYI</p>", "123", "w", "inline",
+            html=True,
+        )
+        assert "<p>FYI</p>" in body
+        assert "Forwarded message" in body
+        assert "From: sender@test.com<br>" in body
+        assert "<blockquote" in body
+        assert attach is None
+
 
 class TestSendEmailToolRegistration:
     def test_send_email_not_registered_by_default(self, connected_client):
@@ -360,6 +408,7 @@ class TestSendEmailToolRegistration:
         cfg = ZimbraConfig(url="https://z.test", user="u", password="p", enable_send=True)
         tools = capture_tools(register_email_tools, connected_client, cfg)
         connected_client.send_message = MagicMock(return_value={"m": {"id": "200"}})
+        connected_client.get_signatures = MagicMock(return_value={})
 
         result = tools["send_email"](
             to=["bob@test.com"], subject="Test", body="Hello",
@@ -369,12 +418,23 @@ class TestSendEmailToolRegistration:
         assert result["success"] is True
         assert result["message_id"] == "200"
 
-    def test_send_email_defaults_to_plain(self, connected_client):
+    def test_send_email_defaults_to_html(self, connected_client):
         cfg = ZimbraConfig(url="https://z.test", user="u", password="p", enable_send=True)
         tools = capture_tools(register_email_tools, connected_client, cfg)
         connected_client.send_message = MagicMock(return_value={"m": {"id": "201"}})
+        connected_client.get_signatures = MagicMock(return_value={})
 
         tools["send_email"](to=["bob@test.com"], subject="T", body="Hi")
+
+        assert connected_client.send_message.call_args.kwargs["html"] is True
+
+    def test_send_email_plain_when_disabled(self, connected_client):
+        cfg = ZimbraConfig(url="https://z.test", user="u", password="p", enable_send=True)
+        tools = capture_tools(register_email_tools, connected_client, cfg)
+        connected_client.send_message = MagicMock(return_value={"m": {"id": "205"}})
+        connected_client.get_signatures = MagicMock(return_value={})
+
+        tools["send_email"](to=["bob@test.com"], subject="T", body="Hi", html=False)
 
         assert connected_client.send_message.call_args.kwargs["html"] is False
 
@@ -382,6 +442,7 @@ class TestSendEmailToolRegistration:
         cfg = ZimbraConfig(url="https://z.test", user="u", password="p", enable_send=True)
         tools = capture_tools(register_email_tools, connected_client, cfg)
         connected_client.send_message = MagicMock(return_value={"m": {"id": "202"}})
+        connected_client.get_signatures = MagicMock(return_value={})
 
         tools["send_email"](
             to=["bob@test.com"], subject="T", body="<p>Hi</p>", html=True,
@@ -389,13 +450,51 @@ class TestSendEmailToolRegistration:
 
         assert connected_client.send_message.call_args.kwargs["html"] is True
 
+    def test_send_email_no_signature_by_default(self, connected_client):
+        cfg = ZimbraConfig(url="https://z.test", user="u", password="p", enable_send=True)
+        tools = capture_tools(register_email_tools, connected_client, cfg)
+        connected_client.send_message = MagicMock(return_value={"m": {"id": "203"}})
+        connected_client.get_signatures = MagicMock()
+
+        tools["send_email"](to=["bob@test.com"], subject="T", body="Hi")
+
+        # append_signature is opt-in: no lookup, body untouched.
+        connected_client.get_signatures.assert_not_called()
+        assert connected_client.send_message.call_args.args[2] == "Hi"
+
+    def test_send_email_appends_signature_when_opted_in(self, connected_client):
+        cfg = ZimbraConfig(url="https://z.test", user="u", password="p", enable_send=True)
+        tools = capture_tools(register_email_tools, connected_client, cfg)
+        connected_client.send_message = MagicMock(return_value={"m": {"id": "204"}})
+        connected_client.get_signatures = MagicMock(return_value={
+            "signature": {"name": "default", "id": "s1", "content": "Bob"},
+        })
+
+        tools["send_email"](
+            to=["bob@test.com"], subject="T", body="Hi", append_signature=True,
+        )
+
+        connected_client.get_signatures.assert_called_once()
+        # html defaults to True → plain signature is appended as HTML.
+        assert connected_client.send_message.call_args.args[2] == "Hi<br><br>-- <br>Bob"
+
 
 class TestCreateDraftTool:
-    def test_create_draft_defaults_to_plain(self, email_tools):
+    def test_create_draft_defaults_to_html(self, email_tools):
         tools, client = email_tools
         client.create_draft = MagicMock(return_value={"m": {"id": "60"}})
 
         tools["create_draft"](to=["bob@test.com"], subject="T", body="Hi")
+
+        assert client.create_draft.call_args.kwargs["html"] is True
+
+    def test_create_draft_plain_when_disabled(self, email_tools):
+        tools, client = email_tools
+        client.create_draft = MagicMock(return_value={"m": {"id": "67"}})
+
+        tools["create_draft"](
+            to=["bob@test.com"], subject="T", body="Hi", html=False,
+        )
 
         assert client.create_draft.call_args.kwargs["html"] is False
 
@@ -408,3 +507,138 @@ class TestCreateDraftTool:
         )
 
         assert client.create_draft.call_args.kwargs["html"] is True
+
+    def test_append_html_signature_forces_html(self, email_tools):
+        tools, client = email_tools
+        client.create_draft = MagicMock(return_value={"m": {"id": "62"}})
+        client.get_signatures = MagicMock(return_value={
+            "signature": [
+                {
+                    "name": "default",
+                    "id": "sig-1",
+                    "content": [
+                        {"type": "text/html", "_content": "<p>Best, Bob</p>"},
+                    ],
+                }
+            ]
+        })
+
+        tools["create_draft"](
+            to=["bob@test.com"], subject="T", body="Hello",
+            append_signature=True,
+        )
+
+        client.get_signatures.assert_called_once()
+        call = client.create_draft.call_args
+        # HTML signature forces the whole draft to HTML.
+        assert call.kwargs["html"] is True
+        sent_body = call.args[2]
+        assert "<p>Best, Bob</p>" in sent_body
+        # The plain body was escaped/wrapped, not lost.
+        assert "Hello" in sent_body
+
+    def test_append_plain_signature_keeps_plain(self, email_tools):
+        tools, client = email_tools
+        client.create_draft = MagicMock(return_value={"m": {"id": "63"}})
+        client.get_signatures = MagicMock(return_value={
+            "signature": {
+                "name": "default",
+                "id": "sig-1",
+                "content": "Cheers,\nBob",
+            }
+        })
+
+        tools["create_draft"](
+            to=["bob@test.com"], subject="T", body="Hello",
+            append_signature=True, html=False,
+        )
+
+        call = client.create_draft.call_args
+        assert call.kwargs["html"] is False
+        sent_body = call.args[2]
+        assert sent_body == "Hello\n\n-- \nCheers,\nBob"
+
+    def test_append_signature_no_signature_leaves_body(self, email_tools):
+        tools, client = email_tools
+        client.create_draft = MagicMock(return_value={"m": {"id": "64"}})
+        client.get_signatures = MagicMock(return_value={})
+
+        tools["create_draft"](
+            to=["bob@test.com"], subject="T", body="Hello",
+            append_signature=True,
+        )
+
+        client.get_signatures.assert_called_once()
+        call = client.create_draft.call_args
+        # No signature → body untouched; html keeps its default (True).
+        assert call.args[2] == "Hello"
+        assert call.kwargs["html"] is True
+
+    def test_append_signature_disabled_skips_lookup(self, email_tools):
+        tools, client = email_tools
+        client.create_draft = MagicMock(return_value={"m": {"id": "65"}})
+        client.get_signatures = MagicMock()
+
+        tools["create_draft"](
+            to=["bob@test.com"], subject="T", body="Hello",
+            append_signature=False,
+        )
+
+        client.get_signatures.assert_not_called()
+        assert client.create_draft.call_args.args[2] == "Hello"
+
+    def test_no_signature_by_default(self, email_tools):
+        tools, client = email_tools
+        client.create_draft = MagicMock(return_value={"m": {"id": "66"}})
+        client.get_signatures = MagicMock()
+
+        tools["create_draft"](to=["bob@test.com"], subject="T", body="Hello")
+
+        # append_signature is opt-in: no lookup, body untouched.
+        client.get_signatures.assert_not_called()
+        assert client.create_draft.call_args.args[2] == "Hello"
+
+    def test_append_signature_when_opted_in(self, email_tools):
+        tools, client = email_tools
+        client.create_draft = MagicMock(return_value={"m": {"id": "67"}})
+        client.get_signatures = MagicMock(return_value={
+            "signature": {"name": "default", "id": "s1", "content": "Bob"},
+        })
+
+        tools["create_draft"](
+            to=["bob@test.com"], subject="T", body="Hello", append_signature=True,
+        )
+
+        client.get_signatures.assert_called_once()
+        # html defaults to True → plain signature is appended as HTML.
+        assert client.create_draft.call_args.args[2] == "Hello<br><br>-- <br>Bob"
+
+
+class TestRefreshSignaturesTool:
+    def test_refresh_forces_reload(self, email_tools):
+        tools, client = email_tools
+        client.get_signatures = MagicMock(return_value={
+            "signature": [
+                {"name": "default", "id": "s1", "content": [
+                    {"type": "text/html", "_content": "<p>Bob</p>"},
+                ]},
+            ]
+        })
+
+        result = tools["refresh_signatures"]()
+
+        client.get_signatures.assert_called_once_with(force_refresh=True)
+        assert result["success"] is True
+        assert result["count"] == 1
+        assert result["first_signature"]["type"] == "text/html"
+        assert result["first_signature"]["preview"] == "<p>Bob</p>"
+
+    def test_refresh_no_signatures(self, email_tools):
+        tools, client = email_tools
+        client.get_signatures = MagicMock(return_value={})
+
+        result = tools["refresh_signatures"]()
+
+        assert result["success"] is True
+        assert result["count"] == 0
+        assert result["first_signature"] is None

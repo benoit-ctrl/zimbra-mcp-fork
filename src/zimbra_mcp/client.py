@@ -1,6 +1,7 @@
 """Zimbra SOAP Client."""
 
 import re
+import time
 from typing import Any
 
 from pythonzimbra.communication import Communication
@@ -13,6 +14,10 @@ from zimbra_mcp.errors import (
     ZimbraNotFoundError,
     ZimbraOperationError,
 )
+
+# Account signatures rarely change; cache them to avoid a SOAP round-trip on
+# every email send/draft.
+SIGNATURES_CACHE_TTL = 3600  # seconds (1 hour)
 
 
 def _build_mime_part(
@@ -52,6 +57,60 @@ def _build_mime_part(
     }
 
 
+def _extract_first_signature(response: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract the first signature from a GetSignaturesResponse.
+
+    Defensive against the variable JSON shapes produced by pythonzimbra:
+    ``signature`` may be a single dict or a list; ``content`` may be a list of
+    parts (each with a ``type`` attribute and ``_content``), a dict, or a plain
+    string.
+
+    Args:
+        response: The GetSignaturesResponse dict.
+
+    Returns:
+        ``{"content": str, "type": "text/html" | "text/plain"}`` for the first
+        signature, or None if none is found / the structure is unexpected.
+    """
+    if not isinstance(response, dict):
+        return None
+
+    signatures = response.get("signature")
+    if isinstance(signatures, dict):
+        signatures = [signatures]
+    if not isinstance(signatures, list) or not signatures:
+        return None
+
+    first = signatures[0]
+    if not isinstance(first, dict):
+        return None
+
+    content = first.get("content")
+    if isinstance(content, list):
+        part = content[0] if content else None
+    else:
+        part = content
+
+    if isinstance(part, dict):
+        text = part.get("_content")
+        if text is None:
+            text = part.get("content")
+        sig_type = part.get("type", "text/plain")
+    elif isinstance(part, str):
+        text = part
+        sig_type = "text/plain"
+    else:
+        return None
+
+    if not isinstance(text, str) or not text:
+        return None
+
+    if sig_type not in ("text/html", "text/plain"):
+        sig_type = "text/plain"
+
+    return {"content": text, "type": sig_type}
+
+
 class ZimbraClient:
     """Client for the Zimbra SOAP API."""
 
@@ -64,6 +123,8 @@ class ZimbraClient:
         self.config = config
         self._comm: Communication | None = None
         self._token: str | None = None
+        self._signatures_cache: dict[str, Any] | None = None
+        self._signatures_cache_ts: float = 0.0
 
     def connect(self) -> None:
         """Establish connection and authentication."""
@@ -364,6 +425,32 @@ class ZimbraClient:
         if draft_id:
             params["m"]["did"] = draft_id
         return self.request("SendMsgRequest", "urn:zimbraMail", params)
+
+    def get_signatures(self, force_refresh: bool = False) -> dict[str, Any]:
+        """Retrieve all account signatures.
+
+        Uses GetSignaturesRequest in the urn:zimbraAccount namespace. The result
+        is cached for SIGNATURES_CACHE_TTL seconds (1 hour) to avoid a SOAP
+        round-trip on every email; pass force_refresh=True to bypass the cache.
+
+        Args:
+            force_refresh: If True, ignore the cache and re-fetch from Zimbra
+
+        Returns:
+            The GetSignaturesResponse (may contain a ``signature`` key)
+        """
+        now = time.time()
+        if (
+            not force_refresh
+            and self._signatures_cache is not None
+            and now - self._signatures_cache_ts < SIGNATURES_CACHE_TTL
+        ):
+            return self._signatures_cache
+
+        result = self.request("GetSignaturesRequest", "urn:zimbraAccount")
+        self._signatures_cache = result
+        self._signatures_cache_ts = now
+        return result
 
     def get_all_tags(self) -> dict[str, Any]:
         """Retrieve all tags."""

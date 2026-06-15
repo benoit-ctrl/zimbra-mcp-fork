@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import os
 import re
+from html import escape
 from pathlib import Path
 from typing import Any
 
 from bs4 import BeautifulSoup
 from mcp.server.fastmcp import FastMCP
 
-from zimbra_mcp.client import ZimbraClient
+from zimbra_mcp.client import ZimbraClient, _extract_first_signature
 from zimbra_mcp.config import ZimbraConfig
 
 
@@ -59,14 +60,63 @@ def _html_to_text(html: str) -> str:
     return text
 
 
+def _plain_to_html(text: str) -> str:
+    """Convert plain text to basic HTML (escape special chars + line breaks)."""
+    return escape(text).replace("\n", "<br>\n")
+
+
+# Inline style for quoted original messages in HTML replies/forwards (mimics
+# the left border used by Gmail/Outlook). Inline because email clients drop
+# <style> blocks.
+_QUOTE_STYLE = "border-left:2px solid #ccc;padding-left:8px;color:#666"
+
+
+def _apply_signature(
+    body: str,
+    html: bool,
+    signature: dict[str, Any],
+) -> tuple[str, bool]:
+    """Append a signature to the body, keeping the formats coherent.
+
+    Args:
+        body: User body (plain text if html is False, HTML otherwise)
+        html: Whether the body is currently HTML
+        signature: ``{"content": str, "type": "text/html" | "text/plain"}``
+
+    Returns:
+        Tuple ``(new_body, new_html)``. ``new_html`` may be forced to True when
+        the signature is HTML so the whole email stays in a single format.
+    """
+    sig_content = signature.get("content", "")
+    sig_type = signature.get("type", "text/plain")
+
+    if sig_type == "text/html":
+        # HTML signature → the whole email must be HTML to stay coherent.
+        body_html = body if html else _plain_to_html(body)
+        return f"{body_html}<br><br>{sig_content}", True
+
+    # Plain-text signature.
+    if html:
+        # Body is HTML → convert the signature to basic HTML.
+        return f"{body}<br><br>-- <br>{_plain_to_html(sig_content)}", True
+
+    # Both plain text → standard signature delimiter.
+    return f"{body}\n\n-- \n{sig_content}", False
+
+
 def _prepare_body_with_original(
     client: ZimbraClient,
     body: str,
     orig_msg_id: str,
     reply_type: str | None,
     include_original: str | None,
+    html: bool = False,
 ) -> tuple[str, str | None]:
     """Prepare body with original message included.
+
+    When html is True, the quoted original is rendered as HTML (escaped text in
+    a styled <blockquote>) so it stays coherent with an HTML body. When False,
+    the legacy plain-text quote ("> ..." / forward header) is used.
 
     Returns:
         Tuple of (full_body, attach_msg_id)
@@ -116,24 +166,44 @@ def _prepare_body_with_original(
     if reply_type == "w":
         orig_to = _extract_addresses(orig_msg.get("e", []), "t")
         orig_subject = orig_msg.get("su", "")
-        full_body = (
-            f"{body}\n\n"
-            f"---------- Forwarded message ---------\n"
-            f"From: {orig_from}\n"
-            f"Date: {orig_date}\n"
-            f"Subject: {orig_subject}\n"
-            f"To: {', '.join(orig_to)}\n\n"
-            f"{orig_text}"
-        )
+        if html:
+            full_body = (
+                f"{body}<br><br>"
+                f"---------- Forwarded message ---------<br>"
+                f"From: {escape(orig_from)}<br>"
+                f"Date: {escape(orig_date)}<br>"
+                f"Subject: {escape(orig_subject)}<br>"
+                f"To: {escape(', '.join(orig_to))}<br><br>"
+                f'<blockquote style="{_QUOTE_STYLE}">'
+                f"{_plain_to_html(orig_text)}</blockquote>"
+            )
+        else:
+            full_body = (
+                f"{body}\n\n"
+                f"---------- Forwarded message ---------\n"
+                f"From: {orig_from}\n"
+                f"Date: {orig_date}\n"
+                f"Subject: {orig_subject}\n"
+                f"To: {', '.join(orig_to)}\n\n"
+                f"{orig_text}"
+            )
     else:
-        quoted = "\n".join(
-            f"> {line}" for line in orig_text.splitlines()
-        )
-        full_body = (
-            f"{body}\n\n"
-            f"On {orig_date}, {orig_from} wrote:\n"
-            f"{quoted}"
-        )
+        if html:
+            full_body = (
+                f"{body}<br><br>"
+                f"On {escape(orig_date)}, {escape(orig_from)} wrote:<br>"
+                f'<blockquote style="{_QUOTE_STYLE}">'
+                f"{_plain_to_html(orig_text)}</blockquote>"
+            )
+        else:
+            quoted = "\n".join(
+                f"> {line}" for line in orig_text.splitlines()
+            )
+            full_body = (
+                f"{body}\n\n"
+                f"On {orig_date}, {orig_from} wrote:\n"
+                f"{quoted}"
+            )
 
     return full_body, None
 
@@ -388,7 +458,8 @@ def register_email_tools(mcp: FastMCP, client: ZimbraClient, config: ZimbraConfi
         orig_msg_id: str | None = None,
         reply_type: str | None = None,
         include_original: str | None = None,
-        html: bool = False,
+        html: bool = True,
+        append_signature: bool = False,
     ) -> dict[str, Any]:
         """Create an email draft (without sending it).
 
@@ -400,12 +471,17 @@ def register_email_tools(mcp: FastMCP, client: ZimbraClient, config: ZimbraConfi
         the original message in the body). Use "attachment" to attach it as .eml
         instead, or "none" to explicitly exclude it.
 
-        Set html=True to send a styled HTML email. The body must be valid HTML
-        (use inline CSS for styling, as email clients ignore <style> blocks and
-        external stylesheets). A plain-text fallback is generated automatically
-        from the HTML. html=True is intended for NEW emails only, not for
-        replies/forwards: the quoted original is built as "> " plain text and
-        would render poorly inside HTML.
+        Emails are sent as HTML by default (html=True). The body is treated as
+        valid HTML: use inline CSS for styling (email clients ignore <style>
+        blocks and external stylesheets), and use <br>/<p> for line breaks.
+        A plain-text fallback is generated automatically. If you want to send
+        raw plain text (preserving newlines, not escaping <, &), pass html=False.
+        For replies/forwards in HTML, the quoted original is rendered in a styled
+        <blockquote>; in plain text it falls back to the "> " quote.
+
+        append_signature=True automatically appends the first signature found on
+        the Zimbra account at the bottom of the email. The signature is added to
+        the user's body before any reply/forward quote.
 
         Args:
             to: List of primary recipients
@@ -416,20 +492,27 @@ def register_email_tools(mcp: FastMCP, client: ZimbraClient, config: ZimbraConfi
             orig_msg_id: ID of the original message when replying or forwarding (optional)
             reply_type: "r" for reply, "w" for forward. Required when orig_msg_id is set (optional)
             include_original: How to include the original message: "inline" (default when replying/forwarding), "attachment", or "none" (optional)
-            html: If True, send body as HTML with an auto-generated plain-text fallback. For new emails only (default: False)
+            html: If True (default), body is HTML with an auto-generated plain-text fallback. Set False to send raw plain text (recommended for replies/forwards)
+            append_signature: If True, append the account's first signature at the bottom of the email (default: False, opt-in). The signature is cached for 1 hour; use refresh_signatures to force a reload
 
         Returns:
             Information about the created draft
         """
-        full_body = body
         attach_msg_id = None
+
+        if append_signature:
+            signature = _extract_first_signature(client.get_signatures())
+            if signature:
+                body, html = _apply_signature(body, html, signature)
+
+        full_body = body
 
         if orig_msg_id and include_original is None:
             include_original = "inline"
 
         if orig_msg_id and include_original and include_original != "none":
             full_body, attach_msg_id = _prepare_body_with_original(
-                client, body, orig_msg_id, reply_type, include_original,
+                client, body, orig_msg_id, reply_type, include_original, html=html,
             )
 
         result = client.create_draft(
@@ -456,6 +539,42 @@ def register_email_tools(mcp: FastMCP, client: ZimbraClient, config: ZimbraConfi
             response["reply_type"] = reply_type
             response["include_original"] = include_original
         return response
+
+    @mcp.tool()
+    def refresh_signatures() -> dict[str, Any]:
+        """Force a refresh of the cached account signatures.
+
+        Account signatures are cached for 1 hour and reused when sending emails
+        or creating drafts with append_signature=True. Call this after editing a
+        signature in Zimbra to pick up the change immediately.
+
+        Returns:
+            The number of signatures and a preview of the first one (the one
+            that gets appended to emails)
+        """
+        result = client.get_signatures(force_refresh=True)
+
+        signatures = result.get("signature")
+        if isinstance(signatures, dict):
+            signatures = [signatures]
+        if not isinstance(signatures, list):
+            signatures = []
+
+        first = _extract_first_signature(result)
+        first_preview = None
+        if first:
+            content = first["content"]
+            first_preview = {
+                "type": first["type"],
+                "preview": content[:200] + "..." if len(content) > 200 else content,
+            }
+
+        return {
+            "success": True,
+            "refreshed": True,
+            "count": len(signatures),
+            "first_signature": first_preview,
+        }
 
     @mcp.tool()
     def download_attachment(
@@ -523,7 +642,8 @@ def register_email_tools(mcp: FastMCP, client: ZimbraClient, config: ZimbraConfi
             reply_type: str | None = None,
             include_original: str | None = None,
             draft_id: str | None = None,
-            html: bool = False,
+            html: bool = True,
+            append_signature: bool = False,
         ) -> dict[str, Any]:
             """Send an email directly. WARNING: sends immediately, cannot be undone.
 
@@ -533,12 +653,17 @@ def register_email_tools(mcp: FastMCP, client: ZimbraClient, config: ZimbraConfi
             Use "attachment" to attach it as .eml instead, or "none" to
             explicitly exclude it.
 
-            Set html=True to send a styled HTML email. The body must be valid
-            HTML (use inline CSS for styling, as email clients ignore <style>
-            blocks and external stylesheets). A plain-text fallback is generated
-            automatically from the HTML. html=True is intended for NEW emails
-            only, not for replies/forwards: the quoted original is built as
-            "> " plain text and would render poorly inside HTML.
+            Emails are sent as HTML by default (html=True). The body is treated
+            as valid HTML: use inline CSS for styling (email clients ignore
+            <style> blocks and external stylesheets), and use <br>/<p> for line
+            breaks. A plain-text fallback is generated automatically. To send raw
+            plain text (preserving newlines, not escaping <, &), pass html=False.
+            For replies/forwards in HTML, the quoted original is rendered in a
+            styled <blockquote>; in plain text it falls back to the "> " quote.
+
+            append_signature=True automatically appends the first signature
+            found on the Zimbra account at the bottom of the email. The signature
+            is added to the user's body before any reply/forward quote.
 
             Args:
                 to: List of primary recipients
@@ -550,20 +675,27 @@ def register_email_tools(mcp: FastMCP, client: ZimbraClient, config: ZimbraConfi
                 reply_type: "r" for reply, "w" for forward. Required when orig_msg_id is set (optional)
                 include_original: How to include the original message: "inline" (default when replying/forwarding), "attachment", or "none" (optional)
                 draft_id: ID of an existing draft to send (optional)
-                html: If True, send body as HTML with an auto-generated plain-text fallback. For new emails only (default: False)
+                html: If True (default), body is HTML with an auto-generated plain-text fallback. Set False to send raw plain text (recommended for replies/forwards)
+                append_signature: If True, append the account's first signature at the bottom of the email (default: False, opt-in). The signature is cached for 1 hour; use refresh_signatures to force a reload
 
             Returns:
                 Information about the sent email
             """
-            full_body = body
             attach_msg_id = None
+
+            if append_signature:
+                signature = _extract_first_signature(client.get_signatures())
+                if signature:
+                    body, html = _apply_signature(body, html, signature)
+
+            full_body = body
 
             if orig_msg_id and include_original is None:
                 include_original = "inline"
 
             if orig_msg_id and include_original and include_original != "none":
                 full_body, attach_msg_id = _prepare_body_with_original(
-                    client, body, orig_msg_id, reply_type, include_original,
+                    client, body, orig_msg_id, reply_type, include_original, html=html,
                 )
 
             result = client.send_message(
